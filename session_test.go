@@ -1025,8 +1025,15 @@ func TestReadDeadline(t *testing.T) {
 	// We assert that we return an error meeting the interface to avoid
 	// accidently breaking yamux session compatability with the standard
 	// library's http server implementation.
-	if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() || !netErr.Temporary() {
-		t.Fatalf("reading timeout error is expected to implement net.Error and return true when calling Timeout()")
+	if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
+		t.Fatalf("reading timeout error must implement net.Error with Timeout() == true for HTTP server compatibility")
+	}
+
+	type frpTLSTemporaryError interface {
+		Temporary() bool
+	}
+	if temporaryErr, ok := err.(frpTLSTemporaryError); !ok || !temporaryErr.Temporary() {
+		t.Fatalf("reading timeout error must implement Temporary() bool with Temporary() == true for FRP/TLS compatibility")
 	}
 }
 

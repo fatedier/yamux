@@ -55,6 +55,8 @@ jobs:
         cache: true
     - name: Run golangci-lint
       uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+      with:
+        version: v2.12.2
     - name: Run race detector tests (skip large data tests)
       run: |
         go test -race -short -v ./...
@@ -65,7 +67,7 @@ jobs:
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with: 
         path: coverage.out
-        name: Coverage-report
+        name: Coverage-report-${{ matrix.go-version }}
     - name: Display coverage report
       run: go tool cover -func=coverage.out
     - name: Build Go
