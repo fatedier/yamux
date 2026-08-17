@@ -1,0 +1,64 @@
+version: "2"
+
+run:
+  # Keep local and CI resource use predictable; this is ample for one small module.
+  concurrency: 4
+  timeout: 5m
+  tests: true
+  # Lint must report an untidy module instead of rewriting go.mod or go.sum.
+  modules-download-mode: readonly
+
+linters:
+  # Pin the policy explicitly so golangci-lint default-set changes cannot alter CI.
+  default: none
+  enable:
+    # Baseline correctness checks shared by golib and frp.
+    - copyloopvar
+    - errcheck
+    - govet
+    - ineffassign
+    - makezero
+    - staticcheck
+    - unparam
+    - unused
+    # Public-source identifier hygiene for a reusable library.
+    - asciicheck
+    # Low-noise maintainability checks that pass the current codebase.
+    - lll
+    - prealloc
+  settings:
+    errcheck:
+      # Explicit blank assignments document intentionally ignored cleanup errors.
+      check-blank: false
+      # Yamux has invariant-backed assertions; comma-ok assertions remain reviewed in code.
+      check-type-assertions: false
+    lll:
+      line-length: 160
+      tab-width: 1
+    unparam:
+      # Exported parameters are part of the public compatibility contract.
+      check-exported: false
+  exclusions:
+    # Only files carrying a recognized generated-code marker bypass source checks.
+    generated: lax
+
+formatters:
+  # Enforce standard Go formatting plus stable import grouping.
+  enable:
+    - gci
+    - gofmt
+    - goimports
+  settings:
+    gci:
+      sections:
+        - standard
+        - default
+        - prefix(github.com/fatedier/yamux/)
+  exclusions:
+    # Generated files are owned by their generator, not formatter fixes.
+    generated: lax
+
+issues:
+  # CI should show the complete debt set rather than truncate diagnostics.
+  max-issues-per-linter: 0
+  max-same-issues: 0
