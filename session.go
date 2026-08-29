@@ -5,7 +5,6 @@ package yamux
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -53,9 +52,10 @@ type Session struct {
 	// streams maps a stream id to a stream, and inflight has an entry
 	// for any outgoing stream that has not yet been established. Both are
 	// protected by streamLock.
-	streams    map[uint32]*Stream
-	inflight   map[uint32]struct{}
-	streamLock sync.Mutex
+	streams      map[uint32]*Stream
+	inflight     map[uint32]struct{}
+	pendingReset map[uint32]<-chan struct{}
+	streamLock   sync.Mutex
 
 	// synCh acts like a semaphore. It is sized to the AcceptBacklog which
 	// is assumed to be symmetric between the client and server. This allows
@@ -82,13 +82,99 @@ type Session struct {
 	shutdownErrLock sync.Mutex
 }
 
-// sendReady is used to either mark a stream as ready
-// or to directly send a header
+type sendReadyState uint8
+
+const (
+	sendReadyQueued sendReadyState = iota
+	sendReadyCommitted
+	sendReadyCompleted
+	sendReadyCanceled
+)
+
+// sendReady owns one queued outbound request. Hdr is copied when the request
+// is created, and Body remains owned by this request until it is either
+// canceled or claimed by sendLoop.
 type sendReady struct {
-	Hdr  []byte
-	mu   sync.Mutex // Protects Body from unsafe reads.
-	Body []byte
-	Err  chan error
+	Hdr      []byte
+	Body     []byte
+	done     chan error
+	onCancel func()
+	onCommit func()
+
+	mu    sync.Mutex
+	state sendReadyState
+}
+
+func newSendReady(hdr header) *sendReady {
+	return newSendReadyWithHooks(hdr, nil, nil)
+}
+
+func newSendReadyWithHooks(hdr header, body []byte, onCancel func()) *sendReady {
+	return newSendReadyWithCommit(hdr, body, onCancel, nil)
+}
+
+func newSendReadyWithCommit(hdr header, body []byte, onCancel, onCommit func()) *sendReady {
+	hdrCopy := make([]byte, len(hdr))
+	copy(hdrCopy, hdr)
+	return &sendReady{
+		Hdr:      hdrCopy,
+		Body:     body,
+		done:     make(chan error, 1),
+		onCancel: onCancel,
+		onCommit: onCommit,
+		state:    sendReadyQueued,
+	}
+}
+
+// cancel prevents a queued request from reaching the wire. It returns false
+// once sendLoop has claimed the request, in which case the caller must wait
+// for the request's actual completion.
+func (r *sendReady) cancel() bool {
+	r.mu.Lock()
+	if r.state != sendReadyQueued {
+		r.mu.Unlock()
+		return false
+	}
+	r.state = sendReadyCanceled
+	r.Body = nil
+	onCancel := r.onCancel
+	r.onCancel = nil
+	r.mu.Unlock()
+	if onCancel != nil {
+		onCancel()
+	}
+	return true
+}
+
+// claim atomically commits a queued request and transfers its body ownership
+// to the send loop. Canceled requests are skipped without touching the wire.
+func (r *sendReady) claim() ([]byte, bool) {
+	r.mu.Lock()
+	if r.state != sendReadyQueued {
+		r.mu.Unlock()
+		return nil, false
+	}
+	r.state = sendReadyCommitted
+	body := r.Body
+	r.Body = nil
+	onCommit := r.onCommit
+	r.onCommit = nil
+	r.mu.Unlock()
+	if onCommit != nil {
+		onCommit()
+	}
+	return body, true
+}
+
+func (r *sendReady) complete(err error) {
+	r.mu.Lock()
+	if r.state != sendReadyCommitted {
+		r.mu.Unlock()
+		return
+	}
+	r.state = sendReadyCompleted
+	r.mu.Unlock()
+	r.done <- err
 }
 
 // newSession is used to construct a new session
@@ -99,19 +185,20 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 	}
 
 	s := &Session{
-		config:     config,
-		logger:     logger,
-		conn:       conn,
-		bufRead:    bufio.NewReader(conn),
-		pings:      make(map[uint32]chan struct{}),
-		streams:    make(map[uint32]*Stream),
-		inflight:   make(map[uint32]struct{}),
-		synCh:      make(chan struct{}, config.AcceptBacklog),
-		acceptCh:   make(chan *Stream, config.AcceptBacklog),
-		sendCh:     make(chan *sendReady, 64),
-		recvDoneCh: make(chan struct{}),
-		sendDoneCh: make(chan struct{}),
-		shutdownCh: make(chan struct{}),
+		config:       config,
+		logger:       logger,
+		conn:         conn,
+		bufRead:      bufio.NewReader(conn),
+		pings:        make(map[uint32]chan struct{}),
+		streams:      make(map[uint32]*Stream),
+		inflight:     make(map[uint32]struct{}),
+		pendingReset: make(map[uint32]<-chan struct{}),
+		synCh:        make(chan struct{}, config.AcceptBacklog),
+		acceptCh:     make(chan *Stream, config.AcceptBacklog),
+		sendCh:       make(chan *sendReady, 64),
+		recvDoneCh:   make(chan struct{}),
+		sendDoneCh:   make(chan struct{}),
+		shutdownCh:   make(chan struct{}),
 	}
 	if client {
 		s.nextStreamID = 1
@@ -196,13 +283,11 @@ GET_ID:
 		go s.setOpenTimeout(stream)
 	}
 
-	// Send the window update to create
-	if err := stream.sendWindowUpdate(); err != nil {
-		select {
-		case <-s.synCh:
-		default:
-			s.logger.Printf("[ERR] yamux: aborted stream open without inflight syn semaphore")
-		}
+	// Send the window update to create. A queued cancellation owns cleanup of
+	// this exact stream; a committed failure gets the same conditional cleanup
+	// without touching a replacement or an already-established stream.
+	if err := stream.sendWindowUpdateWithHooks(func() { s.cleanupOpenStream(stream) }); err != nil {
+		s.cleanupOpenStream(stream)
 		return nil, err
 	}
 	return stream, nil
@@ -239,17 +324,42 @@ func (s *Session) Accept() (net.Conn, error) {
 	return conn, err
 }
 
+// acceptStream finalizes delivery of a stream selected from acceptCh while
+// serializing its ownership decision with Session.Close. Transport I/O stays
+// outside shutdownLock so Close can close a blocked underlying connection.
+func (s *Session) acceptStream(stream *Stream) (*Stream, error) {
+	s.shutdownLock.Lock()
+	shuttingDown := s.shutdown
+	s.shutdownLock.Unlock()
+	if shuttingDown {
+		stream.forceClose()
+		s.closeStreamIfOwned(stream)
+		return nil, s.shutdownError()
+	}
+
+	if err := stream.sendWindowUpdateWithHooks(func() { s.cleanupAcceptedStream(stream) }); err != nil {
+		s.cleanupAcceptedStream(stream)
+		return nil, err
+	}
+
+	s.shutdownLock.Lock()
+	defer s.shutdownLock.Unlock()
+	if s.shutdown {
+		stream.forceClose()
+		s.closeStreamIfOwned(stream)
+		return nil, s.shutdownError()
+	}
+	return stream, nil
+}
+
 // AcceptStream is used to block until the next available stream
 // is ready to be accepted.
 func (s *Session) AcceptStream() (*Stream, error) {
 	select {
 	case stream := <-s.acceptCh:
-		if err := stream.sendWindowUpdate(); err != nil {
-			return nil, err
-		}
-		return stream, nil
+		return s.acceptStream(stream)
 	case <-s.shutdownCh:
-		return nil, s.shutdownErr
+		return nil, s.shutdownError()
 	}
 }
 
@@ -260,12 +370,9 @@ func (s *Session) AcceptStreamWithContext(ctx context.Context) (*Stream, error) 
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case stream := <-s.acceptCh:
-		if err := stream.sendWindowUpdate(); err != nil {
-			return nil, err
-		}
-		return stream, nil
+		return s.acceptStream(stream)
 	case <-s.shutdownCh:
-		return nil, s.shutdownErr
+		return nil, s.shutdownError()
 	}
 }
 
@@ -292,22 +399,67 @@ func (s *Session) Close() error {
 	<-s.recvDoneCh
 
 	s.streamLock.Lock()
-	defer s.streamLock.Unlock()
+	streams := make([]*Stream, 0, len(s.streams))
 	for _, stream := range s.streams {
-		stream.forceClose()
+		streams = append(streams, stream)
 	}
+	s.streamLock.Unlock()
+	for _, stream := range streams {
+		stream.forceClose()
+		s.closeStreamIfOwned(stream)
+	}
+	s.drainAcceptedStreams()
 	<-s.sendDoneCh
 	return nil
 }
 
-// exitErr is used to handle an error that is causing the
-// session to terminate.
-func (s *Session) exitErr(err error) {
+// drainAcceptedStreams releases channel ownership for streams that were
+// queued before shutdown. recvDoneCh has already completed when Close calls
+// this, so no producer can add another stream concurrently.
+func (s *Session) drainAcceptedStreams() {
+	for {
+		select {
+		case stream := <-s.acceptCh:
+			stream.forceClose()
+			s.closeStreamIfOwned(stream)
+		default:
+			return
+		}
+	}
+}
+
+// shutdownError returns the first recorded session termination error.
+func (s *Session) shutdownError() error {
+	s.shutdownErrLock.Lock()
+	err := s.shutdownErr
+	s.shutdownErrLock.Unlock()
+	return err
+}
+
+// isShuttingDown reports whether session termination has been latched. The
+// error is recorded before a failed send request is completed so readers of
+// already-buffered data can distinguish shutdown transport errors from normal
+// request failures.
+func (s *Session) isShuttingDown() bool {
+	s.shutdownErrLock.Lock()
+	shuttingDown := s.shutdownErr != nil
+	s.shutdownErrLock.Unlock()
+	return shuttingDown
+}
+
+// recordShutdownErr records the first terminal session error.
+func (s *Session) recordShutdownErr(err error) {
 	s.shutdownErrLock.Lock()
 	if s.shutdownErr == nil {
 		s.shutdownErr = err
 	}
 	s.shutdownErrLock.Unlock()
+}
+
+// exitErr is used to handle an error that is causing the
+// session to terminate.
+func (s *Session) exitErr(err error) {
+	s.recordShutdownErr(err)
 	_ = s.Close()
 }
 
@@ -336,6 +488,11 @@ func (s *Session) Ping() (time.Duration, error) {
 	s.pingID++
 	s.pings[id] = ch
 	s.pingLock.Unlock()
+	defer func() {
+		s.pingLock.Lock()
+		delete(s.pings, id)
+		s.pingLock.Unlock()
+	}()
 
 	// Send the ping request
 	hdr := header(make([]byte, headerSize))
@@ -349,9 +506,6 @@ func (s *Session) Ping() (time.Duration, error) {
 	select {
 	case <-ch:
 	case <-time.After(s.config.ConnectionWriteTimeout):
-		s.pingLock.Lock()
-		delete(s.pings, id) // Ignore it if a response comes later.
-		s.pingLock.Unlock()
 		return 0, ErrTimeout
 	case <-s.shutdownCh:
 		return 0, ErrSessionShutdown
@@ -383,14 +537,23 @@ func (s *Session) keepalive() {
 
 // waitForSendErr waits to send a header, checking for a potential shutdown
 func (s *Session) waitForSend(hdr header, body []byte) error {
-	errCh := make(chan error, 1)
-	return s.waitForSendErr(hdr, body, errCh)
+	return s.waitForSendErr(hdr, body)
 }
 
 // waitForSendErr waits to send a header with optional data, checking for a
 // potential shutdown. Since there's the expectation that sends can happen
-// in a timely manner, we enforce the connection write timeout here.
-func (s *Session) waitForSendErr(hdr header, body []byte, errCh chan error) error {
+// in a timely manner, we enforce the connection write timeout here. A timeout
+// or shutdown cancels only a request that is still queued. Once sendLoop has
+// committed the request, this waits for its actual transport completion.
+func (s *Session) waitForSendErr(hdr header, body []byte) error {
+	return s.waitForSendErrWithHooks(hdr, body, nil)
+}
+
+func (s *Session) waitForSendErrWithHooks(hdr header, body []byte, onCancel func()) error {
+	return s.waitForSendErrWithCommit(hdr, body, onCancel, nil)
+}
+
+func (s *Session) waitForSendErrWithCommit(hdr header, body []byte, onCancel, onCommit func()) error {
 	t := timerPool.Get()
 	timer := t.(*time.Timer)
 	timer.Reset(s.config.ConnectionWriteTimeout)
@@ -403,44 +566,34 @@ func (s *Session) waitForSendErr(hdr header, body []byte, errCh chan error) erro
 		timerPool.Put(t)
 	}()
 
-	ready := &sendReady{Hdr: hdr, Body: body, Err: errCh}
+	ready := newSendReadyWithCommit(hdr, body, onCancel, onCommit)
 	select {
 	case s.sendCh <- ready:
 	case <-s.shutdownCh:
-		return ErrSessionShutdown
+		if ready.cancel() {
+			return ErrSessionShutdown
+		}
+		return <-ready.done
 	case <-timer.C:
-		return ErrConnectionWriteTimeout
-	}
-
-	bodyCopy := func() {
-		if body == nil {
-			return // A nil body is ignored.
+		if ready.cancel() {
+			return s.sendCancellationError(ErrConnectionWriteTimeout)
 		}
-
-		// In the event of session shutdown or connection write timeout,
-		// we need to prevent `send` from reading the body buffer after
-		// returning from this function since the caller may re-use the
-		// underlying array.
-		ready.mu.Lock()
-		defer ready.mu.Unlock()
-
-		if ready.Body == nil {
-			return // Body was already copied in `send`.
-		}
-		newBody := make([]byte, len(body))
-		copy(newBody, body)
-		ready.Body = newBody
+		return <-ready.done
 	}
 
 	select {
-	case err := <-errCh:
+	case err := <-ready.done:
 		return err
 	case <-s.shutdownCh:
-		bodyCopy()
-		return ErrSessionShutdown
+		if ready.cancel() {
+			return ErrSessionShutdown
+		}
+		return <-ready.done
 	case <-timer.C:
-		bodyCopy()
-		return ErrConnectionWriteTimeout
+		if ready.cancel() {
+			return s.sendCancellationError(ErrConnectionWriteTimeout)
+		}
+		return <-ready.done
 	}
 }
 
@@ -460,13 +613,25 @@ func (s *Session) sendNoWait(hdr header) error {
 		timerPool.Put(t)
 	}()
 
+	ready := newSendReady(hdr)
 	select {
-	case s.sendCh <- &sendReady{Hdr: hdr}:
+	case s.sendCh <- ready:
 		return nil
 	case <-s.shutdownCh:
+		ready.cancel()
 		return ErrSessionShutdown
 	case <-timer.C:
-		return ErrConnectionWriteTimeout
+		ready.cancel()
+		return s.sendCancellationError(ErrConnectionWriteTimeout)
+	}
+}
+
+func (s *Session) sendCancellationError(timeoutErr error) error {
+	select {
+	case <-s.shutdownCh:
+		return ErrSessionShutdown
+	default:
+		return timeoutErr
 	}
 }
 
@@ -479,54 +644,43 @@ func (s *Session) send() {
 
 func (s *Session) sendLoop() error {
 	defer close(s.sendDoneCh)
-	var bodyBuf bytes.Buffer
 	for {
-		bodyBuf.Reset()
-
 		select {
 		case ready := <-s.sendCh:
-			// Send a header if ready
-			if ready.Hdr != nil {
-				_, err := s.conn.Write(ready.Hdr)
-				if err != nil {
-					s.logger.Printf("[ERR] yamux: Failed to write header: %v", err)
-					asyncSendErr(ready.Err, err)
-					return err
-				}
+			body, ok := ready.claim()
+			if !ok {
+				continue
 			}
 
-			ready.mu.Lock()
-			if ready.Body != nil {
-				// Copy the body into the buffer to avoid
-				// holding a mutex lock during the write.
-				_, err := bodyBuf.Write(ready.Body)
-				if err != nil {
-					ready.Body = nil
-					ready.mu.Unlock()
-					s.logger.Printf("[ERR] yamux: Failed to copy body into buffer: %v", err)
-					asyncSendErr(ready.Err, err)
-					return err
-				}
-				ready.Body = nil
+			if err := writeFrame(s.conn, ready.Hdr); err != nil {
+				s.logger.Printf("[ERR] yamux: Failed to write header: %v", err)
+				s.recordShutdownErr(err)
+				ready.complete(err)
+				return err
 			}
-			ready.mu.Unlock()
 
-			if bodyBuf.Len() > 0 {
-				// Send data from a body if given
-				_, err := s.conn.Write(bodyBuf.Bytes())
-				if err != nil {
+			if len(body) > 0 {
+				if err := writeFrame(s.conn, body); err != nil {
 					s.logger.Printf("[ERR] yamux: Failed to write body: %v", err)
-					asyncSendErr(ready.Err, err)
+					s.recordShutdownErr(err)
+					ready.complete(err)
 					return err
 				}
 			}
 
-			// No error, successful send
-			asyncSendErr(ready.Err, nil)
+			ready.complete(nil)
 		case <-s.shutdownCh:
 			return nil
 		}
 	}
+}
+
+func writeFrame(w io.Writer, p []byte) error {
+	n, err := w.Write(p)
+	if n != len(p) && err == nil {
+		return io.ErrShortWrite
+	}
+	return err
 }
 
 // recv is a long running goroutine that accepts new data
@@ -597,9 +751,15 @@ func (s *Session) handleStreamMessage(hdr header) error {
 		// Drain any data on the wire
 		if hdr.MsgType() == typeData && hdr.Length() > 0 {
 			s.logger.Printf("[WARN] yamux: Discarding data for stream: %d", id)
-			if _, err := io.CopyN(io.Discard, s.bufRead, int64(hdr.Length())); err != nil {
+			length := int64(hdr.Length())
+			copied, err := io.Copy(io.Discard, &io.LimitedReader{R: s.bufRead, N: length})
+			if err == nil && copied != length {
+				// Preserve the historical drain error for a truncated body.
+				err = io.EOF
+			}
+			if err != nil {
 				s.logger.Printf("[ERR] yamux: Failed to discard data: %v", err)
-				return nil
+				return err
 			}
 		} else {
 			s.logger.Printf("[WARN] yamux: frame for missing stream: %v", hdr)
@@ -691,6 +851,13 @@ func (s *Session) incomingStream(id uint32) error {
 	s.streamLock.Lock()
 	defer s.streamLock.Unlock()
 
+	if s.pendingReset[id] != nil {
+		// A timeout reset for this ID has not reached sendCh yet. Ignore a
+		// concurrent declaration until that reset is admitted so the old reset
+		// cannot be mistaken for a newly registered stream.
+		return nil
+	}
+
 	// Check if stream already exists
 	if _, ok := s.streams[id]; ok {
 		s.logger.Printf("[ERR] yamux: duplicate stream declared")
@@ -717,30 +884,135 @@ func (s *Session) incomingStream(id uint32) error {
 	}
 }
 
-// closeStream is used to close a stream once both sides have
-// issued a close. If there was an in-flight SYN and the stream
-// was not yet established, then this will give the credit back.
-func (s *Session) closeStream(id uint32) {
+func (s *Session) closeStreamIfOwned(stream *Stream) {
 	s.streamLock.Lock()
-	if _, ok := s.inflight[id]; ok {
+	s.closeStreamIfOwnedLocked(stream)
+	s.streamLock.Unlock()
+}
+
+func (s *Session) closeStreamIfOwnedLocked(stream *Stream) bool {
+	current, ok := s.streams[stream.id]
+	if !ok || current != stream {
+		return false
+	}
+	if _, inflight := s.inflight[stream.id]; inflight {
+		delete(s.inflight, stream.id)
 		select {
 		case <-s.synCh:
 		default:
 			s.logger.Printf("[ERR] yamux: SYN tracking out of sync")
 		}
 	}
-	delete(s.streams, id)
+	delete(s.streams, stream.id)
+	return true
+}
+
+// resetStreamIfOwned queues a reset while the exact stream still owns its
+// registry entry, then removes it. The injected enqueue variant is used by the
+// ownership linearization test.
+func (s *Session) resetStreamIfOwned(stream *Stream, enqueue func(header) error) bool {
+	hdr := header(make([]byte, headerSize))
+	hdr.encode(typeWindowUpdate, flagRST, stream.id, 0)
+
+	s.streamLock.Lock()
+	defer s.streamLock.Unlock()
+	if current, ok := s.streams[stream.id]; !ok || current != stream {
+		return false
+	}
+	if !s.IsClosed() {
+		_ = enqueue(hdr)
+	}
+	return s.closeStreamIfOwnedLocked(stream)
+}
+
+func (s *Session) resetStreamIfOwnedNonblocking(stream *Stream) bool {
+	hdr := header(make([]byte, headerSize))
+	hdr.encode(typeWindowUpdate, flagRST, stream.id, 0)
+
+	s.streamLock.Lock()
+	if current, ok := s.streams[stream.id]; !ok || current != stream {
+		s.streamLock.Unlock()
+		return false
+	}
+	if s.pendingReset == nil {
+		s.pendingReset = make(map[uint32]<-chan struct{})
+	}
+	done := make(chan struct{})
+	s.pendingReset[stream.id] = done
+	s.closeStreamIfOwnedLocked(stream)
+	s.streamLock.Unlock()
+
+	go func() {
+		if !s.IsClosed() {
+			_ = s.sendNoWait(hdr)
+		}
+		s.streamLock.Lock()
+		if s.pendingReset[stream.id] == done {
+			delete(s.pendingReset, stream.id)
+		}
+		s.streamLock.Unlock()
+		close(done)
+	}()
+	return true
+}
+
+// cleanupOpenStream removes a canceled or failed outbound open only when the
+// session still owns the exact stream and its SYN is still inflight. This makes
+// the semaphore return conditional and prevents deleting a replacement or an
+// stream that has already been established by a racing ACK.
+func (s *Session) cleanupOpenStream(stream *Stream) {
+	if !stream.claimPendingOpenCleanup() {
+		return
+	}
+	s.streamLock.Lock()
+	current, ok := s.streams[stream.id]
+	if !ok || current != stream {
+		s.streamLock.Unlock()
+		return
+	}
+	if _, ok := s.inflight[stream.id]; !ok {
+		s.streamLock.Unlock()
+		return
+	}
+	delete(s.inflight, stream.id)
+	delete(s.streams, stream.id)
+	select {
+	case <-s.synCh:
+	default:
+		s.logger.Printf("[ERR] yamux: aborted stream open without inflight syn semaphore")
+	}
+	s.streamLock.Unlock()
+}
+
+// cleanupAcceptedStream removes a canceled inbound ACK only when the session
+// still owns the exact not-yet-established stream. It never touches synCh.
+func (s *Session) cleanupAcceptedStream(stream *Stream) {
+	if !stream.claimPendingOpenCleanup() {
+		return
+	}
+
+	s.streamLock.Lock()
+	current, ok := s.streams[stream.id]
+	if ok && current == stream {
+		delete(s.streams, stream.id)
+	}
 	s.streamLock.Unlock()
 }
 
 // establishStream is used to mark a stream that was in the
 // SYN Sent state as established.
-func (s *Session) establishStream(id uint32) {
+func (s *Session) establishStream(stream *Stream) bool {
 	s.streamLock.Lock()
-	if _, ok := s.inflight[id]; ok {
-		delete(s.inflight, id)
+	current, ok := s.streams[stream.id]
+	if !ok || current != stream {
+		s.streamLock.Unlock()
+		return false
+	}
+	if _, ok := s.inflight[stream.id]; ok {
+		delete(s.inflight, stream.id)
 	} else {
-		s.logger.Printf("[ERR] yamux: established stream without inflight SYN (no tracking entry)")
+		s.streamLock.Unlock()
+		return false
 	}
 	select {
 	case <-s.synCh:
@@ -748,4 +1020,5 @@ func (s *Session) establishStream(id uint32) {
 		s.logger.Printf("[ERR] yamux: established stream without inflight SYN (didn't have semaphore)")
 	}
 	s.streamLock.Unlock()
+	return true
 }
