@@ -131,6 +131,7 @@ func (s *Stream) StreamID() uint32 {
 // receive different chunks of data from the Stream and be unable to reassemble
 // them in order or along message boundaries, and may encounter deadlocks.
 func (s *Stream) Read(b []byte) (n int, err error) {
+	var updateCanceled bool
 	defer asyncNotify(s.recvNotifyCh)
 START:
 
@@ -167,10 +168,11 @@ START:
 	s.stateLock.Unlock()
 
 	// Send a window update potentially
-	err = s.sendWindowUpdate()
-	if err == ErrSessionShutdown || (err != nil && err != ErrConnectionReset && s.session.isShuttingDown()) {
+	updateCanceled, err = s.sendWindowUpdateWithHooks(nil)
+	if err == ErrSessionShutdown || (err != nil && (!updateCanceled || err != ErrConnectionReset) && s.session.isShuttingDown()) {
 		// A failed window update may terminate the session after bytes have
-		// already been read. Preserve those bytes, but never hide a reset.
+		// already been read. Only cancellation by this stream's Reset must
+		// survive shutdown; a transport may return ErrConnectionReset too.
 		err = nil
 	}
 	return n, err
@@ -332,13 +334,15 @@ func (s *Stream) sendFlags() (uint16, func()) {
 // sendWindowUpdate potentially sends a window update enabling
 // further writes to take place. Must be invoked with the lock.
 func (s *Stream) sendWindowUpdate() error {
-	return s.sendWindowUpdateWithHooks(nil)
+	_, err := s.sendWindowUpdateWithHooks(nil)
+	return err
 }
 
 // sendWindowUpdateWithHooks potentially sends a window update and invokes
 // onCancel only after a queued request has been canceled and its provisional
-// effects have been rolled back.
-func (s *Stream) sendWindowUpdateWithHooks(onCancel func()) error {
+// effects have been rolled back. The first result reports queued cancellation,
+// distinguishing a local reset from a committed transport error of the same value.
+func (s *Stream) sendWindowUpdateWithHooks(onCancel func()) (bool, error) {
 	s.controlHdrLock.Lock()
 	defer s.controlHdrLock.Unlock()
 
@@ -350,6 +354,13 @@ func (s *Stream) sendWindowUpdateWithHooks(onCancel func()) error {
 
 	var bufLen uint32
 	s.recvLock.Lock()
+	if s.recvReset {
+		// Reset discarded the buffer without returning receive credit. That
+		// credit is no longer usable, including when Accept delivers a stream
+		// that the peer reset while it was still queued in acceptCh.
+		s.recvLock.Unlock()
+		return false, nil
+	}
 	if s.recvBuf != nil {
 		bufLen = uint32(s.recvBuf.Len())
 	}
@@ -358,7 +369,7 @@ func (s *Stream) sendWindowUpdateWithHooks(onCancel func()) error {
 	// Check if we can omit the update
 	if delta < (max/2) && flags == 0 {
 		s.recvLock.Unlock()
-		return nil
+		return false, nil
 	}
 
 	// Reserve the advertised credit before enqueueing so a committed header
@@ -369,7 +380,9 @@ func (s *Stream) sendWindowUpdateWithHooks(onCancel func()) error {
 
 	// Send the header
 	s.controlHdr.encode(typeWindowUpdate, flags, s.id, delta)
+	var canceled bool
 	rollback := func() {
+		canceled = true
 		s.recvLock.Lock()
 		if s.recvWindow >= delta {
 			s.recvWindow -= delta
@@ -395,14 +408,14 @@ func (s *Stream) sendWindowUpdateWithHooks(onCancel func()) error {
 		}
 	}
 	if err := s.session.waitForSendErrWithAbort(s.controlHdr, nil, rollback, onCommit, s.resetCh); err != nil {
-		return err
+		return canceled, err
 	}
 	if flags&flagACK != 0 {
 		s.stateLock.Lock()
 		s.openInFlight = false
 		s.stateLock.Unlock()
 	}
-	return nil
+	return false, nil
 }
 
 // sendClose is used to send a FIN. onCancel is invoked only when the queued

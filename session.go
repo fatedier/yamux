@@ -303,7 +303,7 @@ GET_ID:
 	// Send the window update to create. A queued cancellation owns cleanup of
 	// this exact stream; a committed failure gets the same conditional cleanup
 	// without touching a replacement or an already-established stream.
-	if err := stream.sendWindowUpdateWithHooks(func() { s.cleanupOpenStream(stream) }); err != nil {
+	if _, err := stream.sendWindowUpdateWithHooks(func() { s.cleanupOpenStream(stream) }); err != nil {
 		s.cleanupOpenStream(stream)
 		return nil, err
 	}
@@ -354,7 +354,7 @@ func (s *Session) acceptStream(stream *Stream) (*Stream, error) {
 		return nil, s.shutdownError()
 	}
 
-	if err := stream.sendWindowUpdateWithHooks(func() { s.cleanupAcceptedStream(stream) }); err != nil {
+	if _, err := stream.sendWindowUpdateWithHooks(func() { s.cleanupAcceptedStream(stream) }); err != nil {
 		s.cleanupAcceptedStream(stream)
 		return nil, err
 	}
