@@ -100,6 +100,9 @@ type sendReady struct {
 	done     chan error
 	onCancel func()
 	onCommit func()
+	// abortCh cancels stream requests on a local Reset, until claim commits
+	// them. RST itself never carries this channel.
+	abortCh <-chan struct{}
 
 	mu    sync.Mutex
 	state sendReadyState
@@ -153,6 +156,20 @@ func (r *sendReady) claim() ([]byte, bool) {
 	if r.state != sendReadyQueued {
 		r.mu.Unlock()
 		return nil, false
+	}
+	select {
+	case <-r.abortCh:
+		r.state = sendReadyCanceled
+		r.Body = nil
+		onCancel := r.onCancel
+		r.onCancel = nil
+		r.mu.Unlock()
+		if onCancel != nil {
+			onCancel()
+		}
+		r.done <- ErrConnectionReset
+		return nil, false
+	default:
 	}
 	r.state = sendReadyCommitted
 	body := r.Body
@@ -554,6 +571,10 @@ func (s *Session) waitForSendErrWithHooks(hdr header, body []byte, onCancel func
 }
 
 func (s *Session) waitForSendErrWithCommit(hdr header, body []byte, onCancel, onCommit func()) error {
+	return s.waitForSendErrWithAbort(hdr, body, onCancel, onCommit, nil)
+}
+
+func (s *Session) waitForSendErrWithAbort(hdr header, body []byte, onCancel, onCommit func(), abortCh <-chan struct{}) error {
 	t := timerPool.Get()
 	timer := t.(*time.Timer)
 	timer.Reset(s.config.ConnectionWriteTimeout)
@@ -567,8 +588,25 @@ func (s *Session) waitForSendErrWithCommit(hdr header, body []byte, onCancel, on
 	}()
 
 	ready := newSendReadyWithCommit(hdr, body, onCancel, onCommit)
+	ready.abortCh = abortCh
+	// Prefer an already published terminal state over an available queue slot.
+	select {
+	case <-abortCh:
+		ready.cancel()
+		return ErrConnectionReset
+	default:
+	}
+	if s.IsClosed() {
+		ready.cancel()
+		return ErrSessionShutdown
+	}
 	select {
 	case s.sendCh <- ready:
+	case <-abortCh:
+		if ready.cancel() {
+			return ErrConnectionReset
+		}
+		return <-ready.done
 	case <-s.shutdownCh:
 		if ready.cancel() {
 			return ErrSessionShutdown
@@ -584,6 +622,11 @@ func (s *Session) waitForSendErrWithCommit(hdr header, body []byte, onCancel, on
 	select {
 	case err := <-ready.done:
 		return err
+	case <-abortCh:
+		if ready.cancel() {
+			return ErrConnectionReset
+		}
+		return <-ready.done
 	case <-s.shutdownCh:
 		if ready.cancel() {
 			return ErrSessionShutdown
@@ -929,10 +972,44 @@ func (s *Session) resetStreamIfOwnedNonblocking(stream *Stream) bool {
 	hdr := header(make([]byte, headerSize))
 	hdr.encode(typeWindowUpdate, flagRST, stream.id, 0)
 
-	s.streamLock.Lock()
-	if current, ok := s.streams[stream.id]; !ok || current != stream {
-		s.streamLock.Unlock()
+	done := s.beginPendingReset(stream)
+	if done == nil {
 		return false
+	}
+	go func() {
+		defer s.finishPendingReset(stream.id, done)
+		if !s.IsClosed() {
+			_ = s.sendNoWait(hdr)
+		}
+	}()
+	return true
+}
+
+// sendResetIfOwned is the synchronous public Reset path. Keep the stream ID
+// reserved through cancellation or transport completion so a late RST cannot
+// affect a replacement. Neither queue admission nor I/O holds streamLock.
+func (s *Session) sendResetIfOwned(stream *Stream) error {
+	done := s.beginPendingReset(stream)
+	if done == nil {
+		if s.IsClosed() {
+			return ErrSessionShutdown
+		}
+		return nil
+	}
+	defer s.finishPendingReset(stream.id, done)
+	hdr := header(make([]byte, headerSize))
+	hdr.encode(typeWindowUpdate, flagRST, stream.id, 0)
+	return s.waitForSendErr(hdr, nil)
+}
+
+// beginPendingReset atomically removes the exact stream and reserves its ID.
+// The timeout path releases the reservation after admission; public Reset
+// releases it after the send attempt completes.
+func (s *Session) beginPendingReset(stream *Stream) chan struct{} {
+	s.streamLock.Lock()
+	defer s.streamLock.Unlock()
+	if current, ok := s.streams[stream.id]; !ok || current != stream {
+		return nil
 	}
 	if s.pendingReset == nil {
 		s.pendingReset = make(map[uint32]<-chan struct{})
@@ -940,20 +1017,16 @@ func (s *Session) resetStreamIfOwnedNonblocking(stream *Stream) bool {
 	done := make(chan struct{})
 	s.pendingReset[stream.id] = done
 	s.closeStreamIfOwnedLocked(stream)
-	s.streamLock.Unlock()
+	return done
+}
 
-	go func() {
-		if !s.IsClosed() {
-			_ = s.sendNoWait(hdr)
-		}
-		s.streamLock.Lock()
-		if s.pendingReset[stream.id] == done {
-			delete(s.pendingReset, stream.id)
-		}
-		s.streamLock.Unlock()
-		close(done)
-	}()
-	return true
+func (s *Session) finishPendingReset(id uint32, done chan struct{}) {
+	s.streamLock.Lock()
+	if s.pendingReset[id] == done {
+		delete(s.pendingReset, id)
+	}
+	s.streamLock.Unlock()
+	close(done)
 }
 
 // cleanupOpenStream removes a canceled or failed outbound open only when the
