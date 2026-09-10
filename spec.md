@@ -115,6 +115,86 @@ Once both sides have closed the connection, the stream is closed.
 Alternatively, if an error occurs, the RST flag can be used to
 hard close a stream immediately.
 
+### Resetting a stream
+
+`(*Stream).Reset() error` aborts both directions locally, discards unread
+data, removes the stream from the session, and sends one version-0 Window
+Update with flags `0x8` (RST), the stream ID, and length zero. It does not
+send FIN, SYN, or ACK with the RST. No reset acknowledgement exists in the
+protocol, and other streams remain usable.
+
+After the local reset transition, Read and Write return
+`ErrConnectionReset`, including calls with empty buffers. Readers waiting
+for data and writers waiting for flow-control credit wake up. Queued data,
+window updates, and FINs are canceled before transport commitment. A Read
+that already copied data may return those bytes with an error; a Write
+whose frame has already committed waits for that frame's actual transport
+result and may return a successful or partial write. Reset cannot retract
+bytes already submitted to the connection or consumed by the peer.
+
+Reset returns nil after the underlying connection accepts the complete RST
+header. This does not prove that the peer has processed it. Failure to queue
+or commit before `ConnectionWriteTimeout` returns
+`ErrConnectionWriteTimeout`; session shutdown before commitment returns
+`ErrSessionShutdown`. After commitment, Reset waits for the underlying
+Write and returns its error, including `io.ErrShortWrite`. Stream read/write
+deadlines do not govern Reset. A committed write therefore needs the
+underlying transport to complete or be interrupted by session closure.
+
+The local transition is irreversible even when sending RST fails.
+Concurrent and repeated Reset calls share the same attempt and result,
+including failures, without retrying or sending duplicate RSTs. A failed
+RST can leave the peer unaware of the reset; the caller can close the
+session if it needs to terminate that connection too.
+
+Reset can abort either half-closed state. A concurrent Close retains the
+result of its FIN attempt: a queued FIN canceled by Reset returns
+`ErrConnectionReset`, while a committed FIN reports its transport result.
+Calls joining that Close share its result; a committed FIN failure remains
+the result of repeated Close calls, even after reset. Otherwise Close after
+reset returns nil. The existing close timeout remains nonblocking: it
+force-closes locally and admits its ownership-checked RST asynchronously.
+If the timeout wins first, Reset is a no-op preserving that terminal state.
+If public Reset wins first, the timer leaves its send attempt untouched.
+
+On a fully closed or remotely reset stream, Reset returns nil without
+sending anything or changing the existing terminal state. Thus a completed
+graceful close or session teardown preserves buffered reads followed by
+EOF and `ErrStreamClosed` for nonempty writes. If Reset wins the terminal
+transition first, subsequent session teardown preserves
+`ErrConnectionReset` and does not restore discarded data. If shutdown
+starts before Reset but has not closed the stream yet, Reset can still
+win locally and return `ErrSessionShutdown` for the unsent RST.
+
+Reset removes only the exact stream it owns. A `pendingReset` reservation
+protects that ID until its send attempt completes or is canceled; a SYN for
+the same ID is ignored during this interval. Sending never holds the session
+registry lock, so unrelated streams and session teardown can proceed. A
+stale stream handle cannot reset or remove a replacement. Accept's shutdown
+checks and Session.Close's cleanup of selected and queued streams still
+apply, and their forced closes preserve an existing reset state.
+
+### Compatibility with older peers
+
+Reset uses the existing version-0 RST flag; it requires no negotiation,
+protocol version change, or matching public API on the peer. It can be
+sent after SYN and before ACK, or after a half-close. Local pending-SYN
+credit is released exactly once. An incoming stream already in the accept
+queue may still be returned by AcceptStream after receiving RST; its Read
+and Write report `ErrConnectionReset`.
+
+Receivers accept RST in either Data or Window Update frames. A Data frame's
+payload must still be consumed to preserve framing, even though its data
+is discarded. In-flight data and late ACK, FIN, or RST for a removed stream
+are drained or ignored. They must not close unrelated streams.
+
+Compatibility is at the wire level. Older implementations need not provide
+the same local cancellation, buffer reclamation, idempotency, or error
+precedence during simultaneous session shutdown. In particular, versions
+whose session teardown overwrites reset state can report EOF or
+`ErrStreamClosed` instead of `ErrConnectionReset` in that race. Reset cannot
+guarantee delivery when queueing or the underlying connection fails.
+
 ## Flow Control
 
 When Yamux is initially starts each stream with a 256KB window size.

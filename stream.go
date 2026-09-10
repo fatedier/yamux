@@ -52,6 +52,10 @@ type Stream struct {
 	closePending bool
 	closeResult  *streamCloseResult
 	terminal     bool
+	// resetResult retains the single local RST attempt, including its error.
+	// resetCh is closed only by a local Reset, to cancel queued sends.
+	resetResult *streamCloseResult
+	resetCh     chan struct{}
 	// openInFlight tracks ownership of a stream that is not yet established.
 	// openPending is true only while its SYN/ACK request is still queued.
 	openInFlight bool
@@ -59,6 +63,13 @@ type Stream struct {
 
 	recvBuf  *bytes.Buffer
 	recvLock sync.Mutex
+	// recvReset is protected by recvLock so an in-flight frame cannot refill
+	// the receive buffer after either a local or remote reset.
+	recvReset bool
+	// recvInFlight reserves the unpublished tail of recvBuf for recvLoop.
+	// A normal close must wait for that frame before reporting EOF. Reset
+	// discards it immediately. Protected by recvLock.
+	recvInFlight bool
 
 	controlHdr     header
 	controlHdrLock sync.Mutex
@@ -94,6 +105,7 @@ func newStream(session *Session, id uint32, state streamState) *Stream {
 		recvNotifyCh: make(chan struct{}, 1),
 		sendNotifyCh: make(chan struct{}, 1),
 		establishCh:  make(chan struct{}, 1),
+		resetCh:      make(chan struct{}),
 	}
 	if state == streamInit || state == streamSYNReceived {
 		s.openInFlight = true
@@ -114,7 +126,7 @@ func (s *Stream) StreamID() uint32 {
 }
 
 // Read is used to read from the stream. It is safe to call Write, Read, and/or
-// Close concurrently with each other, but calls to Read are not reentrant and
+// Close or Reset concurrently with each other, but calls to Read are not reentrant and
 // should not be called from multiple goroutines. Multiple Read goroutines would
 // receive different chunks of data from the Stream and be unable to reassemble
 // them in order or along message boundaries, and may encounter deadlocks.
@@ -131,7 +143,7 @@ START:
 		fallthrough
 	case streamClosed:
 		s.recvLock.Lock()
-		if s.recvBuf == nil || s.recvBuf.Len() == 0 {
+		if !s.recvInFlight && (s.recvBuf == nil || s.recvBuf.Len() == 0) {
 			s.recvLock.Unlock()
 			s.stateLock.Unlock()
 			return 0, io.EOF
@@ -141,25 +153,24 @@ START:
 		s.stateLock.Unlock()
 		return 0, ErrConnectionReset
 	}
-	s.stateLock.Unlock()
-
 	// If there is no data available, block
 	s.recvLock.Lock()
 	if s.recvBuf == nil || s.recvBuf.Len() == 0 {
 		s.recvLock.Unlock()
+		s.stateLock.Unlock()
 		goto WAIT
 	}
 
 	// Read any bytes
 	n, _ = s.recvBuf.Read(b)
 	s.recvLock.Unlock()
+	s.stateLock.Unlock()
 
 	// Send a window update potentially
 	err = s.sendWindowUpdate()
-	if err != nil && s.session.isShuttingDown() {
-		// A failed update can be the event that terminates this session. The
-		// bytes were already delivered from recvBuf, so preserve the read result
-		// while keeping ordinary request errors visible to callers.
+	if err == ErrSessionShutdown || (err != nil && err != ErrConnectionReset && s.session.isShuttingDown()) {
+		// A failed window update may terminate the session after bytes have
+		// already been read. Preserve those bytes, but never hide a reset.
 		err = nil
 	}
 	return n, err
@@ -188,11 +199,18 @@ WAIT:
 }
 
 // Write is used to write to the stream. It is safe to call Write, Read, and/or
-// Close concurrently with each other, but calls to Write are not reentrant and
+// Close or Reset concurrently with each other, but calls to Write are not reentrant and
 // should not be called from multiple goroutines.
 func (s *Stream) Write(b []byte) (n int, err error) {
 	s.sendLock.Lock()
 	defer s.sendLock.Unlock()
+	// Even an empty write reports a reset, just like an empty Read.
+	s.stateLock.Lock()
+	reset := s.state == streamReset
+	s.stateLock.Unlock()
+	if reset {
+		return 0, ErrConnectionReset
+	}
 	total := 0
 	for total < len(b) {
 		n, err := s.write(b[total:])
@@ -243,7 +261,7 @@ START:
 
 	// Send the header
 	s.sendHdr.encode(typeData, flags, s.id, max)
-	if err = s.session.waitForSendErrWithHooks(s.sendHdr, body, flagsRollback); err != nil {
+	if err = s.session.waitForSendErrWithAbort(s.sendHdr, body, flagsRollback, nil, s.resetCh); err != nil {
 		return 0, err
 	}
 
@@ -376,7 +394,7 @@ func (s *Stream) sendWindowUpdateWithHooks(onCancel func()) error {
 			s.stateLock.Unlock()
 		}
 	}
-	if err := s.session.waitForSendErrWithCommit(s.controlHdr, nil, rollback, onCommit); err != nil {
+	if err := s.session.waitForSendErrWithAbort(s.controlHdr, nil, rollback, onCommit, s.resetCh); err != nil {
 		return err
 	}
 	if flags&flagACK != 0 {
@@ -412,7 +430,7 @@ func (s *Stream) sendClose(onCancel func()) error {
 			s.stateLock.Unlock()
 		}
 	}
-	if err := s.session.waitForSendErrWithCommit(s.controlHdr, nil, rollback, onCommit); err != nil {
+	if err := s.session.waitForSendErrWithAbort(s.controlHdr, nil, rollback, onCommit, s.resetCh); err != nil {
 		return err
 	}
 	if flags&flagACK != 0 {
@@ -423,7 +441,8 @@ func (s *Stream) sendClose(onCancel func()) error {
 	return nil
 }
 
-// Close is used to close the stream. It is safe to call Close concurrently.
+// Close half-closes the stream, prohibiting further writes while allowing
+// reads until the peer closes. It is safe to call Close concurrently.
 func (s *Stream) Close() error {
 	remoteClosePath := false
 	var previousState streamState
@@ -545,29 +564,97 @@ SEND_CLOSE:
 	return err
 }
 
-// closeTimeout is called after StreamCloseTimeout during a close to
-// close this stream.
-func (s *Stream) closeTimeout() {
-	// Close our side forcibly and bind reset queueing to exact registry
-	// ownership. A stale timer must not reset a replacement with the same ID.
-	s.forceClose()
+// Reset aborts the stream and discards unread data. Subsequent Read and Write
+// calls (including empty calls) return ErrConnectionReset. It wakes blocked
+// readers and writers and cancels queued sends. A send already committed to
+// the underlying connection still waits for its actual result; an overlapping
+// Read or Write may therefore return bytes transferred before the reset.
+//
+// Reset waits for the RST frame to be written, not for peer acknowledgement.
+// ConnectionWriteTimeout bounds queueing, but a committed RST waits for the
+// underlying Write to finish. A queue timeout returns ErrConnectionWriteTimeout,
+// session shutdown before commitment returns ErrSessionShutdown, and a committed
+// write failure returns the transport error. The stream stays reset on failure.
+//
+// Concurrent and repeated Reset calls share one result, including failures;
+// they never retry the RST. Reset on an already fully closed or remotely reset
+// stream is a no-op returning nil. Reset may abort a half-closed stream. A
+// concurrent Close keeps the result of its own FIN attempt, including a
+// retained transport failure on repeated Close calls. Close after reset is
+// otherwise a no-op. Session shutdown never changes a reset into an EOF.
+func (s *Stream) Reset() error {
+	s.stateLock.Lock()
+	if result := s.resetResult; result != nil {
+		s.stateLock.Unlock()
+		<-result.done
+		return result.err
+	}
+	if s.terminal || s.state == streamClosed || s.state == streamReset {
+		s.stateLock.Unlock()
+		return nil
+	}
+	result := &streamCloseResult{done: make(chan struct{})}
+	s.resetResult = result
+	s.resetLocked()
+	close(s.resetCh)
+	s.stateLock.Unlock()
+	s.notifyWaiting()
+	result.err = s.session.sendResetIfOwned(s)
+	close(result.done)
+	return result.err
+}
 
-	// Send a RST so the remote side closes too.
+// resetLocked publishes the terminal state while holding stateLock. No
+// transport reads may hold recvLock, so discarding data cannot block on a peer.
+func (s *Stream) resetLocked() {
+	s.state = streamReset
+	s.terminal = true
+	s.closePending = false
+	s.openInFlight = false
+	s.openPending = false
+	if s.closeTimer != nil {
+		s.closeTimer.Stop()
+		s.closeTimer = nil
+	}
+	s.recvLock.Lock()
+	s.recvReset = true
+	s.recvBuf = nil
+	s.recvLock.Unlock()
+}
+
+// closeTimeout retains nonblocking, ownership-checked reset admission. If a
+// public Reset has won the terminal transition, even an already running timer
+// must leave that attempt and its pendingReset reservation to Reset.
+func (s *Stream) closeTimeout() {
+	s.stateLock.Lock()
+	if s.resetResult != nil {
+		s.stateLock.Unlock()
+		return
+	}
+	s.forceCloseLocked()
+	s.stateLock.Unlock()
+	s.notifyWaiting()
 	s.session.resetStreamIfOwnedNonblocking(s)
 }
 
 // forceClose is used for when the session is exiting
 func (s *Stream) forceClose() {
 	s.stateLock.Lock()
+	s.forceCloseLocked()
+	s.stateLock.Unlock()
+	s.notifyWaiting()
+}
+
+func (s *Stream) forceCloseLocked() {
 	s.terminal = true
 	s.closePending = false
-	s.state = streamClosed
+	if s.state != streamReset {
+		s.state = streamClosed
+	}
 	if s.closeTimer != nil {
 		s.closeTimer.Stop()
 		s.closeTimer = nil
 	}
-	s.stateLock.Unlock()
-	s.notifyWaiting()
 }
 
 // terminatePendingOpen marks a not-yet-established stream terminal. It is
@@ -645,11 +732,7 @@ func (s *Stream) processFlags(flags uint16) error {
 		}
 	}
 	if flags&flagRST == flagRST {
-		s.state = streamReset
-		s.terminal = true
-		s.closePending = false
-		s.openInFlight = false
-		s.openPending = false
+		s.resetLocked()
 		closeStream = true
 		s.notifyWaiting()
 	}
@@ -689,53 +772,92 @@ func (s *Stream) incrSendWindow(hdr header, flags uint16) error {
 
 // readData is used to handle a data frame
 func (s *Stream) readData(hdr header, flags uint16, conn io.Reader) error {
-	if err := s.processFlags(flags); err != nil {
+	// Publish a data-frame FIN only after its payload is buffered, so a reader
+	// cannot observe EOF while that payload is still arriving.
+	if err := s.processFlags(flags &^ flagFIN); err != nil {
 		return err
 	}
 
 	// Check that our recv window is not exceeded
 	length := hdr.Length()
 	if length == 0 {
-		return nil
+		return s.processFlags(flags & flagFIN)
 	}
 
-	// Limit the copy to this frame so bytes belonging to the next frame remain
-	// buffered for recvLoop. io.Copy preserves a non-EOF reader error even when
-	// the final read supplies the complete frame.
-	limited := &io.LimitedReader{R: conn, N: int64(length)}
-
-	// Copy into buffer
+	// Admit the frame under stateLock so a close either observes an in-flight
+	// receive or prevents this frame from publishing bytes after EOF.
+	s.stateLock.Lock()
 	s.recvLock.Lock()
-
+	if s.terminal {
+		s.recvLock.Unlock()
+		s.stateLock.Unlock()
+		// Preserve a transport error even if its final Read fills the frame.
+		copied, err := io.Copy(io.Discard, &io.LimitedReader{R: conn, N: int64(length)})
+		if err == nil && copied != int64(length) {
+			err = io.ErrUnexpectedEOF
+		}
+		return err
+	}
 	if length > s.recvWindow {
 		s.session.logger.Printf("[ERR] yamux: receive window exceeded (stream: %d, remain: %d, recv: %d)", s.id, s.recvWindow, length)
 		s.recvLock.Unlock()
+		s.stateLock.Unlock()
 		return ErrRecvWindowExceeded
 	}
 
+	// Read directly into reusable, unpublished buffer capacity. recvLoop is
+	// the only buffer writer; concurrent Read calls advance only its offset.
+	// Neither Read nor Shrink may reset/reuse this tail while it is reserved.
 	if s.recvBuf == nil {
-		// Allocate the receive buffer just-in-time to fit the full data frame.
-		// This way we can read in the whole packet without further allocations.
-		s.recvBuf = bytes.NewBuffer(make([]byte, 0, length))
+		s.recvBuf = new(bytes.Buffer)
 	}
-	copiedLength, err := io.Copy(s.recvBuf, limited)
+	buf := s.recvBuf
+	buf.Grow(int(length))
+	data := buf.AvailableBuffer()[:length]
+	s.recvInFlight = true
+	s.recvLock.Unlock()
+	s.stateLock.Unlock()
+
+	// Unlike io.ReadFull, retain a non-EOF error returned with the final bytes.
+	// Each Read is limited to this frame, leaving the next header untouched.
+	var copiedLength int
+	var err error
+	for copiedLength < len(data) && err == nil {
+		var n int
+		n, err = conn.Read(data[copiedLength:])
+		copiedLength += n
+	}
+	if err == io.EOF {
+		err = nil
+		if copiedLength != len(data) {
+			err = io.ErrUnexpectedEOF
+		}
+	}
 	if err != nil {
 		s.session.logger.Printf("[ERR] yamux: Failed to read stream data: %v", err)
-		s.recvLock.Unlock()
+	}
+
+	s.recvLock.Lock()
+	if !s.recvReset {
+		// Extend the buffer over its own reserved tail: source and destination
+		// are identical, so no temporary payload allocation or copy is needed.
+		_, _ = buf.Write(data[:copiedLength])
+		// Retain partial bytes on transport failure as before; only a reset
+		// discards them. Failed frames never consume receive-window credit.
+		if err == nil {
+			s.recvWindow -= uint32(copiedLength)
+		}
+	}
+	s.recvInFlight = false
+	s.recvLock.Unlock()
+	// Also wake readers on failure: a closed stream may now return its partial
+	// bytes followed by EOF, even when no more DATA will arrive.
+	asyncNotify(s.recvNotifyCh)
+	if err != nil {
 		return err
 	}
-	if copiedLength != int64(length) {
-		s.recvLock.Unlock()
-		return io.ErrUnexpectedEOF
-	}
 
-	// Decrement the receive window
-	s.recvWindow -= uint32(copiedLength)
-	s.recvLock.Unlock()
-
-	// Unblock any readers
-	asyncNotify(s.recvNotifyCh)
-	return nil
+	return s.processFlags(flags & flagFIN)
 }
 
 // SetDeadline sets the read and write deadlines
@@ -768,7 +890,7 @@ func (s *Stream) SetWriteDeadline(t time.Time) error {
 // the idle memory utilization.
 func (s *Stream) Shrink() {
 	s.recvLock.Lock()
-	if s.recvBuf != nil && s.recvBuf.Len() == 0 {
+	if !s.recvInFlight && s.recvBuf != nil && s.recvBuf.Len() == 0 {
 		s.recvBuf = nil
 	}
 	s.recvLock.Unlock()

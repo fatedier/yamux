@@ -31,6 +31,12 @@ It can be used as a guide to implementors of interoperable libraries.
 
 ## Usage
 
+`OpenStream` and `AcceptStream` return a `*Stream`. Use `Close` for a
+graceful half-close, or `Reset` to abort both directions and discard unread
+data. Reset is safe to call concurrently and shares one RST send result
+across repeated calls, including failures. See [reset semantics and wire
+compatibility](spec.md#resetting-a-stream) for error and concurrency details.
+
 Using Yamux is remarkably simple:
 
 ```go
@@ -83,4 +89,3 @@ func server() {
 }
 
 ```
-
