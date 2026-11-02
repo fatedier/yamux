@@ -318,7 +318,7 @@ func TestStreamResetSessionClose(t *testing.T) {
 					if err := stream.Reset(); err != nil {
 						t.Fatal(err)
 					}
-					if _, err := stream.Read(make([]byte, 1)); err != io.EOF {
+					if _, err := stream.Read(make([]byte, 1)); err != ErrSessionShutdown {
 						t.Fatalf("Read = %v", err)
 					}
 					if _, err := stream.Write([]byte("x")); err != ErrStreamClosed {

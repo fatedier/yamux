@@ -43,6 +43,8 @@ type Stream struct {
 
 	state     streamState
 	stateLock sync.Mutex
+	// readErr distinguishes session teardown from a normal FIN. Protected by stateLock.
+	readErr error
 
 	// closePending prevents concurrent Close calls from sending duplicate FINs.
 	// A committed transport failure leaves it set until session teardown so a
@@ -132,10 +134,11 @@ func (s *Stream) StreamID() uint32 {
 // them in order or along message boundaries, and may encounter deadlocks.
 func (s *Stream) Read(b []byte) (n int, err error) {
 	var updateCanceled bool
+	shutdownCh := s.session.shutdownCh
 	defer asyncNotify(s.recvNotifyCh)
 START:
 
-	// If the stream is closed and there's no data buffered, return EOF
+	// If the stream is closed and there's no data buffered, return its read error.
 	s.stateLock.Lock()
 	switch s.state {
 	case streamLocalClose:
@@ -145,9 +148,13 @@ START:
 	case streamClosed:
 		s.recvLock.Lock()
 		if !s.recvInFlight && (s.recvBuf == nil || s.recvBuf.Len() == 0) {
+			err = s.readErr
+			if err == nil {
+				err = io.EOF
+			}
 			s.recvLock.Unlock()
 			s.stateLock.Unlock()
-			return 0, io.EOF
+			return 0, err
 		}
 		s.recvLock.Unlock()
 	case streamReset:
@@ -157,6 +164,11 @@ START:
 	// If there is no data available, block
 	s.recvLock.Lock()
 	if s.recvBuf == nil || s.recvBuf.Len() == 0 {
+		if shutdownCh == nil && !s.recvInFlight {
+			s.recvLock.Unlock()
+			s.stateLock.Unlock()
+			return 0, ErrSessionShutdown
+		}
 		s.recvLock.Unlock()
 		s.stateLock.Unlock()
 		goto WAIT
@@ -187,7 +199,11 @@ WAIT:
 		timeout = timer.C
 	}
 	select {
-	case <-s.session.shutdownCh:
+	case <-shutdownCh:
+		// Recheck Reset and buffered data before reporting shutdown. An
+		// admitted frame still owns its unpublished tail; wait for readData
+		// to publish it without selecting the closed channel again.
+		shutdownCh = nil
 	case <-s.recvNotifyCh:
 	case <-timeout:
 		return 0, ErrTimeout
@@ -659,6 +675,11 @@ func (s *Stream) forceClose() {
 }
 
 func (s *Stream) forceCloseLocked() {
+	// Session teardown must preserve EOF for a stream whose FIN handshake
+	// already completed, as well as the read result of a reset stream.
+	if !s.terminal && s.state != streamRemoteClose && s.session.IsClosed() {
+		s.readErr = ErrSessionShutdown
+	}
 	s.terminal = true
 	s.closePending = false
 	if s.state != streamReset {
@@ -801,7 +822,7 @@ func (s *Stream) readData(hdr header, flags uint16, conn io.Reader) error {
 	// receive or prevents this frame from publishing bytes after EOF.
 	s.stateLock.Lock()
 	s.recvLock.Lock()
-	if s.terminal {
+	if s.terminal || s.session.IsClosed() {
 		s.recvLock.Unlock()
 		s.stateLock.Unlock()
 		// Preserve a transport error even if its final Read fills the frame.
