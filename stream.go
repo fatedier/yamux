@@ -249,6 +249,7 @@ func (s *Stream) write(b []byte) (n int, err error) {
 	var flagsRollback func()
 	var max uint32
 	var body []byte
+	shutdownCh := s.session.shutdownCh
 START:
 	s.stateLock.Lock()
 	switch s.state {
@@ -262,6 +263,9 @@ START:
 		return 0, ErrConnectionReset
 	}
 	s.stateLock.Unlock()
+	if shutdownCh == nil {
+		return 0, ErrSessionShutdown
+	}
 
 	// If there is no data available, block
 	window := atomic.LoadUint32(&s.sendWindow)
@@ -299,7 +303,9 @@ WAIT:
 		timeout = timer.C
 	}
 	select {
-	case <-s.session.shutdownCh:
+	case <-shutdownCh:
+		// Recheck Reset/Close before returning the queued-send shutdown error.
+		shutdownCh = nil
 	case <-s.sendNotifyCh:
 	case <-timeout:
 		return 0, ErrTimeout
