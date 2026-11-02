@@ -177,11 +177,16 @@ func TestStreamReadBufferedDataAfterNestedTransportReset(t *testing.T) {
 		}
 
 		got, err := io.ReadAll(reader)
-		if err != nil || !bytes.Equal(got, payload) {
+		if err != ErrSessionShutdown || !bytes.Equal(got, payload) {
 			t.Fatalf("ReadAll after outer RST = %d/%d bytes, %v", len(got), len(payload), err)
 		}
 		if inner.shutdownError() != ErrConnectionReset {
 			t.Fatalf("inner transport failure = %v", inner.shutdownError())
+		}
+		// Read can report shutdown before teardown reaches the stream. Wait
+		// for teardown before checking that it closed, rather than reset, it.
+		if err := inner.Close(); err != nil {
+			t.Fatal(err)
 		}
 		reader.stateLock.Lock()
 		state, locallyReset := reader.state, reader.resetResult != nil
