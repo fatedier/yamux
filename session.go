@@ -11,6 +11,7 @@ import (
 	"log"
 	"math"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -40,6 +41,9 @@ type Session struct {
 
 	// conn is the underlying connection
 	conn io.ReadWriteCloser
+	// writeDeadlineLock hands deadline ownership to Close without holding a
+	// lock across transport Write or Close calls.
+	writeDeadlineLock sync.Mutex
 
 	// bufRead is a buffered reader
 	bufRead *bufio.Reader
@@ -412,6 +416,10 @@ func (s *Session) Close() error {
 
 	close(s.shutdownCh)
 
+	// Finish any in-flight deadline setter before transport Close takes over.
+	// sendLoop checks shutdownCh under this lock before changing deadlines.
+	s.writeDeadlineLock.Lock()
+	s.writeDeadlineLock.Unlock() //nolint:staticcheck // SA2001: wait for an in-flight setter before transport Close takes deadline ownership.
 	_ = s.conn.Close()
 	<-s.recvDoneCh
 
@@ -514,7 +522,10 @@ func (s *Session) Ping() (time.Duration, error) {
 	// Send the ping request
 	hdr := header(make([]byte, headerSize))
 	hdr.encode(typePing, flagSYN, 0, id)
-	if err := s.waitForSend(hdr, nil); err != nil {
+	// Ping owns its copied header and has no caller-owned body. Its caller may
+	// stop waiting after commitment so keepalive can still terminate a session
+	// whose transport cannot enforce write deadlines.
+	if err := s.waitForSendErrWithAbortBounded(hdr, nil, nil, nil, nil, true); err != nil {
 		return 0, err
 	}
 
@@ -575,6 +586,12 @@ func (s *Session) waitForSendErrWithCommit(hdr header, body []byte, onCancel, on
 }
 
 func (s *Session) waitForSendErrWithAbort(hdr header, body []byte, onCancel, onCommit func(), abortCh <-chan struct{}) error {
+	return s.waitForSendErrWithAbortBounded(hdr, body, onCancel, onCommit, abortCh, false)
+}
+
+// boundedPing only bounds the Ping caller's wait; it does not cancel a
+// committed request. All stream sends still wait for transport completion.
+func (s *Session) waitForSendErrWithAbortBounded(hdr header, body []byte, onCancel, onCommit func(), abortCh <-chan struct{}, boundedPing bool) error {
 	t := timerPool.Get()
 	timer := t.(*time.Timer)
 	timer.Reset(s.config.ConnectionWriteTimeout)
@@ -608,12 +625,12 @@ func (s *Session) waitForSendErrWithAbort(hdr header, body []byte, onCancel, onC
 		}
 		return <-ready.done
 	case <-s.shutdownCh:
-		if ready.cancel() {
+		if ready.cancel() || boundedPing {
 			return ErrSessionShutdown
 		}
 		return <-ready.done
 	case <-timer.C:
-		if ready.cancel() {
+		if ready.cancel() || boundedPing {
 			return s.sendCancellationError(ErrConnectionWriteTimeout)
 		}
 		return <-ready.done
@@ -628,12 +645,12 @@ func (s *Session) waitForSendErrWithAbort(hdr header, body []byte, onCancel, onC
 		}
 		return <-ready.done
 	case <-s.shutdownCh:
-		if ready.cancel() {
+		if ready.cancel() || boundedPing {
 			return ErrSessionShutdown
 		}
 		return <-ready.done
 	case <-timer.C:
-		if ready.cancel() {
+		if ready.cancel() || boundedPing {
 			return s.sendCancellationError(ErrConnectionWriteTimeout)
 		}
 		return <-ready.done
@@ -687,6 +704,57 @@ func (s *Session) send() {
 
 func (s *Session) sendLoop() error {
 	defer close(s.sendDoneCh)
+	deadlineConn, _ := s.conn.(interface{ SetWriteDeadline(time.Time) error })
+	deadlineArmed := false
+	write := func(hdr, body []byte) error {
+		if deadlineConn != nil {
+			s.writeDeadlineLock.Lock()
+			if s.IsClosed() {
+				s.writeDeadlineLock.Unlock()
+				return ErrSessionShutdown
+			}
+			err := deadlineConn.SetWriteDeadline(time.Now().Add(s.config.ConnectionWriteTimeout))
+			s.writeDeadlineLock.Unlock()
+			if err != nil {
+				if deadlineArmed {
+					// A failed clear left a deadline behind. Do not write under
+					// that stale budget when refreshing it also fails.
+					return err
+				}
+				// Some transports expose the method but do not support it.
+				// Keep their existing Write behavior instead of failing a frame.
+				deadlineConn = nil
+			} else {
+				deadlineArmed = true
+				defer func() {
+					s.writeDeadlineLock.Lock()
+					defer s.writeDeadlineLock.Unlock()
+					// After shutdown, Close owns the deadline (for example, TLS
+					// closeNotify sets its own). Never clear it underneath Close.
+					if s.IsClosed() {
+						return
+					}
+					// A rejected clear must leave deadline management enabled so
+					// the next frame refreshes the remaining deadline.
+					if err := deadlineConn.SetWriteDeadline(time.Time{}); err == nil {
+						deadlineArmed = false
+					}
+				}()
+			}
+		}
+		// A single deadline covers the whole frame, including its body.
+		if err := writeFrame(s.conn, hdr); err != nil {
+			s.logger.Printf("[ERR] yamux: Failed to write header: %v", err)
+			return err
+		}
+		if len(body) > 0 {
+			if err := writeFrame(s.conn, body); err != nil {
+				s.logger.Printf("[ERR] yamux: Failed to write body: %v", err)
+				return err
+			}
+		}
+		return nil
+	}
 	for {
 		select {
 		case ready := <-s.sendCh:
@@ -695,20 +763,13 @@ func (s *Session) sendLoop() error {
 				continue
 			}
 
-			if err := writeFrame(s.conn, ready.Hdr); err != nil {
-				s.logger.Printf("[ERR] yamux: Failed to write header: %v", err)
+			if err := write(ready.Hdr, body); err != nil {
+				if os.IsTimeout(err) {
+					err = ErrConnectionWriteTimeout
+				}
 				s.recordShutdownErr(err)
 				ready.complete(err)
 				return err
-			}
-
-			if len(body) > 0 {
-				if err := writeFrame(s.conn, body); err != nil {
-					s.logger.Printf("[ERR] yamux: Failed to write body: %v", err)
-					s.recordShutdownErr(err)
-					ready.complete(err)
-					return err
-				}
 			}
 
 			ready.complete(nil)
