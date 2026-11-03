@@ -963,6 +963,11 @@ func TestHalfCloseSessionShutdown(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 
+	// The reply confirms the receiver has processed all preceding DATA and FIN.
+	if _, err := client.Ping(); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
 	// Shut down the session of the sending side. This should not cause reads
 	// to fail on the receiving side.
 	if err := client.Close(); err != nil {
